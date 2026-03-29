@@ -5,8 +5,10 @@ import os
 
 
 def generate_launch_description():
+    bringup_dir = get_package_share_directory("pioneer_bringup")
+
     slam_params_file = os.path.join(
-        get_package_share_directory("pioneer_bringup"),
+        bringup_dir,
         "config",
         "slam_params.yaml",
     )
