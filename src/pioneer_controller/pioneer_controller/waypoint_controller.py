@@ -11,6 +11,8 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 
+import xml.etree.ElementTree as ET
+
 
 def wrap(angle: float) -> float:
     while angle > math.pi:
@@ -30,6 +32,73 @@ def yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def point_in_polygon(x: float, y: float, polygon) -> bool:
+    inside = False
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+
+        if (y1 > y) != (y2 > y):
+            x_intersect = (x2 - x1) * (y - y1) / ((y2 - y1) + 1e-12) + x1
+            if x <= x_intersect:
+                inside = not inside
+
+    return inside
+
+
+def point_on_segment(
+    px: float, py: float, ax: float, ay: float, bx: float, by: float, tol: float = 1e-9
+) -> bool:
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+
+    cross = abs(abx * apy - aby * apx)
+    if cross > tol:
+        return False
+
+    dot = apx * abx + apy * aby
+    if dot < -tol:
+        return False
+
+    sq_len = abx * abx + aby * aby
+    if dot - sq_len > tol:
+        return False
+
+    return True
+
+
+def point_on_polygon_boundary(x: float, y: float, polygon, tol: float = 1e-9) -> bool:
+    for i in range(len(polygon)):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % len(polygon)]
+        if point_on_segment(x, y, x1, y1, x2, y2, tol):
+            return True
+    return False
+
+
+def rotate_2d(x: float, y: float, yaw: float):
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    return c * x - s * y, s * x + c * y
+
+
+def normalize_pose_values(values: str):
+    nums = [float(v) for v in values.split()]
+    while len(nums) < 6:
+        nums.append(0.0)
+    return nums[:6]
+
+
+def compose_2d_pose(parent_pose, local_pose):
+    px, py, _, _, _, pyaw = parent_pose
+    lx, ly, _, _, _, lyaw = local_pose
+    rx, ry = rotate_2d(lx, ly, pyaw)
+    return (px + rx, py + ry, 0.0, 0.0, 0.0, wrap(pyaw + lyaw))
+
+
 class BugWaypointController(Node):
     def __init__(self):
         super().__init__("bug_waypoint_controller")
@@ -47,9 +116,16 @@ class BugWaypointController(Node):
         self.got_odom = False
 
         self.waypoint_file = Path.home() / "ros_ws/waypoints.txt"
+        self.world_file = (
+            Path.home() / "ros_ws/src/pioneer_gazebo/worlds/james_oval.world"
+        )
+        self.oval_polygon, self.world_obstacles = self.load_world_geometry(
+            self.world_file
+        )
+
         self.waypoints = self.load_waypoints(self.waypoint_file)
         if len(self.waypoints) == 0:
-            self.get_logger().error("No waypoints loaded! Check waypoint.txt")
+            self.get_logger().error("No waypoints loaded! Check waypoints.txt")
 
         self.current_waypoint_index = 0
 
@@ -105,6 +181,112 @@ class BugWaypointController(Node):
         self.output_csv = Path.home() / "bug_path_log.csv"
 
         self.get_logger().info("Bug waypoint controller started")
+
+    def load_world_geometry(self, filepath: Path):
+        try:
+            root = ET.parse(filepath).getroot()
+        except Exception as e:
+            raise RuntimeError(f"Failed to load world file {filepath}: {e}")
+
+        world = root.find("world")
+        if world is None:
+            raise RuntimeError(f"No <world> tag found in {filepath}")
+
+        markers = {}
+        obstacles = []
+
+        for model in world.findall("model"):
+            model_name = model.get("name", "")
+            model_pose_text = model.findtext("pose", default="0 0 0 0 0 0")
+            model_pose = normalize_pose_values(model_pose_text)
+
+            if model_name.startswith("marker"):
+                marker_idx = int(model_name.replace("marker", ""))
+                markers[marker_idx] = (model_pose[0], model_pose[1])
+
+            for link in model.findall("link"):
+                link_pose_text = link.findtext("pose", default="0 0 0 0 0 0")
+                link_pose = compose_2d_pose(
+                    model_pose, normalize_pose_values(link_pose_text)
+                )
+
+                for collision in link.findall("collision"):
+                    col_pose_text = collision.findtext("pose", default="0 0 0 0 0 0")
+                    col_pose = compose_2d_pose(
+                        link_pose, normalize_pose_values(col_pose_text)
+                    )
+
+                    cyl = collision.find("geometry/cylinder")
+                    box = collision.find("geometry/box")
+
+                    if cyl is not None:
+                        radius = float(cyl.findtext("radius"))
+                        obstacles.append(
+                            {
+                                "type": "circle",
+                                "name": f"{model_name}/{collision.get('name', 'collision')}",
+                                "x": col_pose[0],
+                                "y": col_pose[1],
+                                "radius": radius,
+                            }
+                        )
+
+                    elif box is not None:
+                        sx, sy, *_ = [float(v) for v in box.findtext("size").split()]
+                        obstacles.append(
+                            {
+                                "type": "box",
+                                "name": f"{model_name}/{collision.get('name', 'collision')}",
+                                "x": col_pose[0],
+                                "y": col_pose[1],
+                                "yaw": col_pose[5],
+                                "sx": sx,
+                                "sy": sy,
+                            }
+                        )
+
+        required_markers = [1, 2, 3, 4, 5, 6, 7, 8]
+        missing = [m for m in required_markers if m not in markers]
+        if missing:
+            raise RuntimeError(f"Missing marker(s) in world file: {missing}")
+
+        oval_polygon = [markers[i] for i in required_markers]
+
+        self.get_logger().info(
+            f"Loaded world geometry from {filepath}: "
+            f"{len(oval_polygon)} oval marker points, {len(obstacles)} obstacle footprint(s)"
+        )
+
+        return oval_polygon, obstacles
+
+    def waypoint_hits_obstacle(self, x: float, y: float):
+        for obs in self.world_obstacles:
+            if obs["type"] == "circle":
+                if math.hypot(x - obs["x"], y - obs["y"]) <= obs["radius"]:
+                    return obs["name"]
+
+            elif obs["type"] == "box":
+                dx = x - obs["x"]
+                dy = y - obs["y"]
+                lx, ly = rotate_2d(dx, dy, -obs["yaw"])
+                if abs(lx) <= obs["sx"] / 2.0 and abs(ly) <= obs["sy"] / 2.0:
+                    return obs["name"]
+
+        return None
+
+    def validate_waypoint(self, line_num: int, x: float, y: float):
+        if point_on_polygon_boundary(x, y, self.oval_polygon) or not point_in_polygon(
+            x, y, self.oval_polygon
+        ):
+            raise ValueError(
+                f"Line {line_num}: waypoint ({x:.3f}, {y:.3f}) is outside the oval or on its boundary"
+            )
+
+        hit_name = self.waypoint_hits_obstacle(x, y)
+        if hit_name is not None:
+            raise ValueError(
+                f"Line {line_num}: waypoint ({x:.3f}, {y:.3f}) lies on obstacle '{hit_name}'"
+            )
 
     def scan_callback(self, msg: LaserScan):
         self.scan = msg
@@ -171,13 +353,16 @@ class BugWaypointController(Node):
                             f"Line {line_num}: expected 'x,y' or 'x,y,yaw'"
                         )
 
+                    self.validate_waypoint(line_num, x, y)
                     waypoints.append((x, y, yaw))
 
         except Exception as e:
             self.get_logger().error(f"Failed to load waypoint file {filepath}: {e}")
-            waypoints = [(0.0, 0.0, 0.0)]
+            raise
 
-        self.get_logger().info(f"Loaded {len(waypoints)} waypoint(s) from {filepath}")
+        self.get_logger().info(
+            f"Loaded {len(waypoints)} valid waypoint(s) from {filepath}"
+        )
         return waypoints
 
     def get_range_at_angle(self, target_angle: float, window: int = 2) -> float:
