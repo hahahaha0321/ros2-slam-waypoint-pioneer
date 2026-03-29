@@ -1,15 +1,15 @@
-# ROS2 build folders
+# ROS2 build
 build/
 install/
 log/
 
-# Python cache
+# TF graph outputs
+frames_*.pdf
+frames_*.gv
+
+# Python
 __pycache__/
 *.pyc
 
 # VSCode
 .vscode/
-
-# system files
-*.swp
-*.bak
