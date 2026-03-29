@@ -18,6 +18,13 @@ def generate_launch_description():
         "james_oval.world",
     )
 
+    bringup_dir = get_package_share_directory("pioneer_bringup")
+    scan_bridge_file = os.path.join(
+        bringup_dir,
+        "config",
+        "scan_bridge.yaml",
+    )
+
     with open(urdf_file, "r") as f:
         robot_desc = f.read()
 
@@ -40,7 +47,6 @@ def generate_launch_description():
         ],
     )
 
-    # Temporary alias so the Gazebo scan frame can still resolve into the URDF TF tree
     static_lidar_tf = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
@@ -105,7 +111,7 @@ def generate_launch_description():
             "parameter_bridge",
             "--ros-args",
             "-p",
-            "config_file:=/home/hahaha0321/ros_ws/scan_bridge.yaml",
+            f"config_file:={scan_bridge_file}",
             "-p",
             "use_sim_time:=true",
         ],
